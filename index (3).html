@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Paie Registre — Africa Vision Multiservices</title>
+<meta name="description" content="Gestion des salaires : employés, bulletins, avances, congés et contrats.">
+<meta name="theme-color" content="#0F172A">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Paie Registre">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icones/icone-192.png">
+<link rel="icon" href="icones/icone-192.png">
+<link rel="stylesheet" href="styles.css?v=paie-v2">
+<style>
+  html,body{margin:0;background:#F8FAFC}
+  #chargement{
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    color:#64748B;font-size:14px;text-align:center;padding:80px 20px;
+  }
+</style>
+</head>
+<body>
+<div id="racine"><div id="chargement">Ouverture du registre…</div></div>
+<script src="app.js?v=paie-v2"></script>
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", function () {
+    navigator.serviceWorker.register("sw.js").catch(function () {});
+  });
+}
+</script>
+</body>
+</html>
