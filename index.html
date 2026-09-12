@@ -144,6 +144,65 @@ const PAIE = {
     return false;
   }
 
+  /* Stockage persistant : window.storage n'existe qu'en apercu Claude.
+     Ailleurs (GitHub Pages, fichier local) on le rebranche sur localStorage. */
+  (function(){
+    if(window.storage && typeof window.storage.get === "function") return;
+    var PREF = "paie:";
+    var dispo = (function(){
+      try{ localStorage.setItem("paie:test","1"); localStorage.removeItem("paie:test"); return true; }
+      catch(e){ return false; }
+    })();
+    var memoire = {};
+    var prevenu = false;
+    function alerter(msg){
+      if(prevenu) return; prevenu = true;
+      alert("Attention : " + msg + "\n\nVos saisies ne seront pas conservees apres fermeture. "
+          + "Exportez la sauvegarde JSON depuis Parametres avant de quitter.");
+    }
+    if(!dispo) alerter("le navigateur refuse le stockage local (navigation privee ou cookies bloques)");
+    window.storage = {
+      get: function(k){
+        try{
+          var v = dispo ? localStorage.getItem(PREF+k) : (k in memoire ? memoire[k] : null);
+          return Promise.resolve(v === null || v === undefined ? null : { key:k, value:v, shared:false });
+        }catch(e){ return Promise.resolve(null); }
+      },
+      set: function(k, v){
+        var t = String(v);
+        try{
+          if(dispo) localStorage.setItem(PREF+k, t); else memoire[k] = t;
+          return Promise.resolve({ key:k, value:t, shared:false });
+        }catch(e){
+          memoire[k] = t;
+          alerter("la memoire du navigateur est pleine");
+          return Promise.resolve(null);
+        }
+      },
+      delete: function(k){
+        try{ if(dispo) localStorage.removeItem(PREF+k); else delete memoire[k]; }catch(e){}
+        return Promise.resolve({ key:k, deleted:true, shared:false });
+      },
+      list: function(prefixe){
+        var keys = [];
+        try{
+          if(dispo){
+            for(var i=0;i<localStorage.length;i++){
+              var n = localStorage.key(i);
+              if(n && n.indexOf(PREF) === 0){
+                var kk = n.slice(PREF.length);
+                if(!prefixe || kk.indexOf(prefixe) === 0) keys.push(kk);
+              }
+            }
+          }else{
+            keys = Object.keys(memoire).filter(function(kk){ return !prefixe || kk.indexOf(prefixe) === 0; });
+          }
+        }catch(e){}
+        return Promise.resolve({ keys:keys, prefix:prefixe, shared:false });
+      }
+    };
+  })();
+
   /* Charge l'application, seulement maintenant */
   function ouvrir(){
     const bloc = document.getElementById("code-appli");
