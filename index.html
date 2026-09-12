@@ -58,6 +58,7 @@ const PAIE = {
     <input id="porte-mdp" type="password" autocomplete="current-password" placeholder="••••••••">
 
     <button id="porte-btn" class="porte-btn">Ouvrir le registre</button>
+    <button id="porte-oubli" class="porte-lien">Mot de passe oublié ?</button>
     <p class="porte-pied">Toute ouverture est réservée au DG et au DGA.</p>
   </div>
 </div>
@@ -86,7 +87,7 @@ const PAIE = {
     font-size:10.5px;letter-spacing:.18em;text-transform:uppercase;color:#A9B7C2;margin:0 0 8px;
   }
   .porte-titre{font-size:27px;margin:0 0 6px;letter-spacing:.01em}
-  .porte-note{font-size:13.5px;color:#A9B7C2;margin:0 0 22px}dga@africavisioncargo.com
+  .porte-note{font-size:13.5px;color:#A9B7C2;margin:0 0 22px}
   .porte-label{
     display:block;margin:0 0 6px;
     font-family:ui-monospace,"Courier New",monospace;
@@ -109,6 +110,14 @@ const PAIE = {
     background:rgba(200,69,46,.12);padding:11px 13px;font-size:13.5px;color:#F3C9C1;
   }
   .porte-alerte.visible{display:block}
+  .porte-alerte.ok{border-left-color:#3E9C6A;background:rgba(62,156,106,.12);color:#CFE9D9}
+  .porte-lien{
+    display:block;width:100%;margin:12px 0 0;padding:6px 0;
+    background:none;border:0;cursor:pointer;color:#A9B7C2;
+    font-family:inherit;font-size:12.5px;text-decoration:underline;text-underline-offset:3px;
+  }
+  .porte-lien:hover{color:#F2A93B}
+  .porte-lien[disabled]{opacity:.55;cursor:progress;text-decoration:none}
   .porte-pied{
     margin:16px 0 0;padding-top:14px;border-top:1px dashed #24455F;
     font-family:ui-monospace,"Courier New",monospace;
@@ -120,8 +129,9 @@ const PAIE = {
 (function(){
   const CLE_SESSION = "av_session";
   const alerte = document.getElementById("porte-alerte");
-  const dire = t => { alerte.textContent = t; alerte.classList.add("visible"); };
-  const taire = () => alerte.classList.remove("visible");
+  const dire = t => { alerte.textContent = t; alerte.classList.remove("ok"); alerte.classList.add("visible"); };
+  const direOk = t => { alerte.textContent = t; alerte.classList.add("ok", "visible"); };
+  const taire = () => alerte.classList.remove("visible", "ok");
 
   function estAutorise(email, roles){
     const e = String(email || "").toLowerCase();
@@ -136,8 +146,10 @@ const PAIE = {
 
   /* Charge l'application, seulement maintenant */
   function ouvrir(){
+    const bloc = document.getElementById("code-appli");
+    if(!bloc){ document.addEventListener("DOMContentLoaded", ouvrir, { once:true }); return; }
     document.getElementById("porte").classList.add("ouverte");
-    const code = document.getElementById("code-appli").textContent;
+    const code = bloc.textContent;
     document.getElementById("code-appli").textContent = "";
     (0, eval)(code);
   }
@@ -174,16 +186,26 @@ const PAIE = {
           body: JSON.stringify({ email, password: mdp, returnSecureToken: true }) });
       const d = await r.json();
       if(!r.ok){
-        const m = (d.error && d.error.message) || "";
-        dire(m.indexOf("TOO_MANY") === 0
-          ? "Trop de tentatives. Réessayez dans quelques minutes."
-          : "E-mail ou mot de passe incorrect.");
+        const m = String((d.error && d.error.message) || "");
+        let msg;
+        if(m.indexOf("TOO_MANY") === 0)              msg = "Trop de tentatives. Réessayez dans quelques minutes.";
+        else if(m.indexOf("EMAIL_NOT_FOUND") === 0)  msg = "Cette adresse n'existe pas dans Firebase Authentication. Créez le compte dans la console Firebase.";
+        else if(m.indexOf("INVALID_PASSWORD") === 0) msg = "Mot de passe incorrect pour cette adresse.";
+        else if(m.indexOf("INVALID_LOGIN") === 0)    msg = "E-mail ou mot de passe incorrect (le compte existe peut-être avec un autre mot de passe).";
+        else if(m.indexOf("USER_DISABLED") === 0)    msg = "Ce compte est désactivé dans Firebase.";
+        else if(m.indexOf("PASSWORD_LOGIN_DISABLED") === 0) msg = "La connexion e-mail/mot de passe n'est pas activée dans Firebase (Authentication → Sign-in method).";
+        else if(m.indexOf("API key not valid") !== -1 || m.indexOf("API_KEY") !== -1) msg = "Clé API invalide ou restreinte. Vérifiez la clé et ses restrictions de référent HTTP.";
+        else if(m.indexOf("blocked") !== -1 || m.indexOf("referer") !== -1) msg = "La clé API refuse ce domaine. Ajoutez le domaine dans les restrictions de la clé (Google Cloud → Identifiants).";
+        else msg = "Échec de la connexion.";
+        dire(msg + "  [code : " + (m || r.status) + "]");
         return;
       }
       const session = { idToken:d.idToken, refreshToken:d.refreshToken, uid:d.localId,
                         email:d.email, expire: Date.now() + (Number(d.expiresIn)-60)*1000 };
-      if(!(await estAutorise(session.email, await rolesDe(session)))){
-        dire("Ce compte n'a pas accès à la paie. Seuls le DG et le DGA sont autorisés.");
+      if(!estAutorise(session.email, await rolesDe(session))){
+        dire("Mot de passe accepté, mais « " + session.email + " » n'est pas dans la liste des autorisés. "
+           + "Ajoutez cette adresse dans PAIE.autorises, ou donnez-lui le rôle dg/dga dans Firestore "
+           + "(utilisateurs/" + session.uid + ", champ roles).");
         return;
       }
       localStorage.setItem(CLE_SESSION, JSON.stringify(session));
@@ -193,6 +215,42 @@ const PAIE = {
       dire("Connexion impossible. Vérifiez le réseau et réessayez.");
     }finally{
       btn.disabled = false; btn.textContent = "Ouvrir le registre";
+    }
+  });
+
+  document.getElementById("porte-oubli").addEventListener("click", async () => {
+    const lien = document.getElementById("porte-oubli");
+    const email = document.getElementById("porte-email").value.trim();
+    taire();
+    if(!email){
+      dire("Écrivez d'abord votre e-mail dans le champ au-dessus, puis recliquez ici.");
+      document.getElementById("porte-email").focus();
+      return;
+    }
+    lien.disabled = true; lien.textContent = "Envoi en cours…";
+    try{
+      const r = await fetch("https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=" + PAIE.cleApi,
+        { method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({ requestType:"PASSWORD_RESET", email }) });
+      const d = await r.json();
+      if(!r.ok){
+        const m = String((d.error && d.error.message) || "");
+        let msg;
+        if(m.indexOf("EMAIL_NOT_FOUND") === 0)   msg = "Aucun compte avec cette adresse dans Firebase.";
+        else if(m.indexOf("INVALID_EMAIL") === 0) msg = "Adresse e-mail mal écrite.";
+        else if(m.indexOf("MISSING_EMAIL") === 0) msg = "Adresse e-mail manquante.";
+        else if(m.indexOf("TOO_MANY") === 0)      msg = "Trop de demandes. Attendez quelques minutes.";
+        else if(m.indexOf("RESET_PASSWORD_EXCEED_LIMIT") === 0) msg = "Limite d'envois atteinte pour aujourd'hui. Réessayez demain, ou changez le mot de passe depuis la console Firebase.";
+        else msg = "Envoi impossible.";
+        dire(msg + "  [code : " + (m || r.status) + "]");
+        return;
+      }
+      direOk("E-mail envoyé à " + email + ". Ouvrez le lien Firebase, choisissez un nouveau mot de passe, "
+           + "puis revenez ici pour vous connecter. Pensez à regarder dans les spams.");
+    }catch(e){
+      dire("Envoi impossible. Vérifiez le réseau et réessayez.");
+    }finally{
+      lien.disabled = false; lien.textContent = "Mot de passe oublié ?";
     }
   });
 
