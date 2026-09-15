@@ -144,58 +144,317 @@ const PAIE = {
     return false;
   }
 
-  /* Stockage persistant : window.storage n'existe qu'en apercu Claude.
-     Ailleurs (GitHub Pages, fichier local) on le rebranche sur localStorage. */
+  /* ═══════════ STOCKAGE SYNCHRONISÉ PC ⇄ TÉLÉPHONE ═══════════
+     Avant : tout restait dans le localStorage de CHAQUE appareil
+     (le PC et le téléphone avaient chacun leur propre registre).
+     Maintenant : copie locale (rapide, hors ligne) + copie commune
+     dans Firestore : paie/registre (+ morceaux paie/registre_p0, _p1…).
+     Dans l'aperçu Claude, window.storage existe déjà : on n'y touche pas. */
   (function(){
     if(window.storage && typeof window.storage.get === "function") return;
+
     var PREF = "paie:";
+    var CLE_DONNEES = "paie-registre:v1";
+    var TAILLE = 300000;            /* caractères par morceau (< 1 Mo Firestore) */
+    var RACINE = "projects/" + PAIE.projet + "/databases/(default)/documents";
+    var API = "https://firestore.googleapis.com/v1/";
+
     var dispo = (function(){
       try{ localStorage.setItem("paie:test","1"); localStorage.removeItem("paie:test"); return true; }
       catch(e){ return false; }
     })();
     var memoire = {};
-    var prevenu = false;
-    function alerter(msg){
-      if(prevenu) return; prevenu = true;
-      alert("Attention : " + msg + "\n\nVos saisies ne seront pas conservees apres fermeture. "
-          + "Exportez la sauvegarde JSON depuis Parametres avant de quitter.");
+    function lireL(k){ try{ return dispo ? localStorage.getItem(PREF+k) : (k in memoire ? memoire[k] : null); }catch(e){ return (k in memoire ? memoire[k] : null); } }
+    function ecrireL(k, v){
+      try{ if(dispo){ localStorage.setItem(PREF+k, v); return true; } }catch(e){}
+      memoire[k] = v; return false;
     }
-    if(!dispo) alerter("le navigateur refuse le stockage local (navigation privee ou cookies bloques)");
+    function oublierL(k){ try{ if(dispo) localStorage.removeItem(PREF+k); }catch(e){} delete memoire[k]; }
+    if(!dispo) setTimeout(function(){
+      alert("Attention : le navigateur refuse le stockage local (navigation privée ?).\n"
+          + "Les saisies seront quand même envoyées au serveur tant que la connexion tient.");
+    }, 0);
+
+    /* Nom de cet appareil (affiché en cas de conflit) */
+    var appareil = lireL("__appareil");
+    if(!appareil){
+      var ua = navigator.userAgent || "";
+      appareil = (/Android|iPhone|iPad|Mobile/i.test(ua) ? "Téléphone" : "Ordinateur")
+               + " " + Math.random().toString(36).slice(2, 6).toUpperCase();
+      ecrireL("__appareil", appareil);
+    }
+    function base(){ return Number(lireL("__base") || 0); }
+    function sale(){ return lireL("__sale") === "1"; }
+
+    /* ── Indicateur + bandeau ── */
+    var pastille = null, bandeau = null;
+    function ui(){
+      if(pastille || !document.body) return;
+      var st = document.createElement("style");
+      st.textContent =
+        "#sync-pastille{position:fixed;right:10px;bottom:10px;z-index:9998;font:600 12px system-ui,sans-serif;"
+      + "padding:6px 10px;border-radius:999px;background:#16295C;color:#fff;box-shadow:0 2px 8px rgba(0,0,0,.25);cursor:pointer;opacity:.92}"
+      + "#sync-pastille.att{background:#B7791F}#sync-pastille.err{background:#C8452E}"
+      + "#sync-bandeau{position:fixed;left:0;right:0;top:0;z-index:9999;background:#FFF4DB;color:#3A2A05;border-bottom:2px solid #F2A93B;"
+      + "font:14px system-ui,sans-serif;padding:10px 12px;display:none;box-shadow:0 2px 10px rgba(0,0,0,.2)}"
+      + "#sync-bandeau button{margin:6px 8px 0 0;padding:7px 12px;border:0;border-radius:4px;font-weight:700;cursor:pointer;background:#16295C;color:#fff}"
+      + "#sync-bandeau button.second{background:#fff;color:#16295C;border:1px solid #16295C}"
+      + "@media print{#sync-pastille,#sync-bandeau{display:none!important}}";
+      document.head.appendChild(st);
+      pastille = document.createElement("div"); pastille.id = "sync-pastille";
+      pastille.title = "Cliquer pour synchroniser maintenant";
+      pastille.onclick = function(){ if(sale()) envoyer(false); else verifierDistant(true); };
+      bandeau = document.createElement("div"); bandeau.id = "sync-bandeau";
+      document.body.appendChild(pastille); document.body.appendChild(bandeau);
+    }
+    function etat(txt, classe){
+      ui(); if(!pastille) return;
+      pastille.textContent = txt; pastille.className = classe || "";
+    }
+    function montrerBandeau(msg, boutons){
+      ui(); if(!bandeau) return;
+      bandeau.innerHTML = "";
+      var p = document.createElement("div"); p.textContent = msg; bandeau.appendChild(p);
+      boutons.forEach(function(b, i){
+        var x = document.createElement("button"); x.textContent = b[0];
+        if(i > 0) x.className = "second";
+        x.onclick = function(){ cacherBandeau(); b[1](); };
+        bandeau.appendChild(x);
+      });
+      bandeau.style.display = "block";
+    }
+    function cacherBandeau(){ if(bandeau) bandeau.style.display = "none"; }
+
+    /* ── Jeton Firebase (rafraîchi automatiquement, il expire toutes les heures) ── */
+    async function jeton(){
+      var s = null;
+      try{ s = JSON.parse(localStorage.getItem("av_session") || "null"); }catch(e){}
+      if(!s) throw new Error("pas de session");
+      if(Date.now() < s.expire) return s;
+      if(!s.refreshToken) throw new Error("session expirée");
+      var r = await fetch("https://securetoken.googleapis.com/v1/token?key=" + PAIE.cleApi, {
+        method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"},
+        body:"grant_type=refresh_token&refresh_token=" + encodeURIComponent(s.refreshToken) });
+      if(!r.ok) throw new Error("rafraîchissement refusé");
+      var d = await r.json();
+      s.idToken = d.id_token; s.refreshToken = d.refresh_token;
+      s.expire = Date.now() + (Number(d.expires_in) - 60) * 1000;
+      try{ localStorage.setItem("av_session", JSON.stringify(s)); }catch(e){}
+      return s;
+    }
+    async function lireDoc(nom){
+      var s = await jeton();
+      var r = await fetch(API + RACINE + "/paie/" + nom, { headers:{ Authorization:"Bearer " + s.idToken } });
+      if(r.status === 404) return null;
+      if(!r.ok) throw new Error("lecture " + r.status);
+      return (await r.json()).fields || {};
+    }
+    async function lireMeta(){
+      var f = await lireDoc("registre");
+      if(!f || !f.majLe) return null;
+      return { majLe:Number(f.majLe.integerValue || 0), parties:Number((f.parties||{}).integerValue || 0),
+               appareil:(f.appareil||{}).stringValue || "autre appareil", par:(f.par||{}).stringValue || "" };
+    }
+    async function lireDistant(meta){
+      for(var essai = 0; essai < 3; essai++){
+        var morceaux = [], ok = true;
+        for(var i = 0; i < meta.parties; i++){
+          var f = await lireDoc("registre_p" + i);
+          if(!f || Number((f.majLe||{}).integerValue || 0) !== meta.majLe){ ok = false; break; }
+          morceaux.push((f.t||{}).stringValue || "");
+        }
+        if(ok) return morceaux.join("");
+        meta = await lireMeta();              /* écriture en cours ailleurs : on relit */
+        if(!meta) return null;
+      }
+      throw new Error("données serveur incohérentes");
+    }
+    async function ecrireDistant(texte, majLe){
+      var s = await jeton();
+      var parts = [];
+      for(var i = 0; i < texte.length; i += TAILLE) parts.push(texte.slice(i, i + TAILLE));
+      if(!parts.length) parts = [""];
+      if(parts.length > 30) throw new Error("registre trop volumineux (photos ?)");
+      var writes = parts.map(function(p, i){
+        return { update:{ name:RACINE + "/paie/registre_p" + i,
+          fields:{ t:{ stringValue:p }, majLe:{ integerValue:String(majLe) } } } };
+      });
+      writes.push({ update:{ name:RACINE + "/paie/registre",
+        fields:{ majLe:{ integerValue:String(majLe) }, parties:{ integerValue:String(parts.length) },
+                 appareil:{ stringValue:appareil }, par:{ stringValue:s.email || "" } } } });
+      var r = await fetch(API + RACINE + ":commit", {
+        method:"POST", headers:{ "Content-Type":"application/json", Authorization:"Bearer " + s.idToken },
+        body:JSON.stringify({ writes:writes }) });
+      if(!r.ok){
+        var m = ""; try{ m = JSON.stringify(await r.json()); }catch(e){}
+        throw new Error("écriture " + r.status + " " + m);
+      }
+    }
+
+    function resume(txt){
+      try{
+        var d = JSON.parse(txt);
+        return (d.employes||[]).length + " employé(s), " + (d.bulletins||[]).length + " bulletin(s), "
+             + (d.avances||[]).length + " avance(s)";
+      }catch(e){ return "contenu illisible"; }
+    }
+    function quand(ms){ try{ return new Date(ms).toLocaleString("fr-FR"); }catch(e){ return String(ms); } }
+
+    function adopter(texte, majLe){
+      var ancien = lireL(CLE_DONNEES);
+      if(ancien !== null && ancien !== texte) ecrireL("__secours", ancien);  /* filet de sécurité */
+      ecrireL(CLE_DONNEES, texte);
+      ecrireL("__base", String(majLe));
+      ecrireL("__sale", "0");
+    }
+
+    /* ── Envoi vers le serveur ── */
+    var minuterie = null, enCours = false, relancer = false;
+    function planifier(delai){
+      clearTimeout(minuterie);
+      minuterie = setTimeout(function(){ envoyer(false); }, delai == null ? 1500 : delai);
+    }
+    async function envoyer(forcer){
+      if(enCours){ relancer = true; return; }
+      enCours = true;
+      etat("↻ Envoi…", "att");
+      try{
+        var meta = await lireMeta();
+        if(meta && meta.majLe !== base() && !forcer){ conflit(meta); return; }
+        var texte = lireL(CLE_DONNEES);
+        if(texte === null){ etat("✓ Synchronisé"); return; }
+        var maj = Math.max(Date.now(), (meta ? meta.majLe : 0) + 1);
+        await ecrireDistant(texte, maj);
+        ecrireL("__base", String(maj));
+        if(lireL(CLE_DONNEES) === texte){ ecrireL("__sale", "0"); etat("✓ Synchronisé"); }
+        else relancer = true;
+      }catch(e){
+        console.warn("Synchro paie :", e);
+        etat(navigator.onLine === false ? "⚠ Hors ligne — envoi plus tard" : "⚠ Non envoyé — réessai…", "err");
+        planifier(30000);
+      }finally{
+        enCours = false;
+        if(relancer){ relancer = false; planifier(500); }
+      }
+    }
+
+    function conflit(meta){
+      etat("⚠ Conflit", "err");
+      montrerBandeau(
+        "Conflit : « " + meta.appareil + " » a enregistré la paie le " + quand(meta.majLe)
+        + " pendant que cet appareil avait aussi des changements non envoyés. Laquelle garder ?",
+        [
+          ["Prendre la version du serveur", function(){ recharger(meta, true); }],
+          ["Garder celle de cet appareil", function(){ envoyer(true); }]
+        ]);
+    }
+    async function recharger(meta, garderSecours){
+      try{
+        etat("↻ Réception…", "att");
+        meta = meta || await lireMeta();
+        if(!meta) return;
+        var t = await lireDistant(meta);
+        if(t === null) return;
+        adopter(t, meta.majLe);
+        location.reload();
+      }catch(e){
+        etat("⚠ Réception impossible", "err");
+      }
+    }
+
+    /* ── Vérifie si l'autre appareil a modifié quelque chose ── */
+    async function verifierDistant(auto){
+      if(document.hidden || enCours) return;
+      try{
+        var meta = await lireMeta();
+        if(!meta || meta.majLe === base()){ if(!sale()) etat("✓ Synchronisé"); return; }
+        if(sale()){ conflit(meta); return; }
+        if(auto){ recharger(meta); return; }      /* retour sur l'appli : mise à jour directe */
+        montrerBandeau("Des modifications ont été faites sur « " + meta.appareil + " » ("
+          + quand(meta.majLe) + ").", [["Mettre à jour maintenant", function(){ recharger(meta); }]]);
+      }catch(e){ etat("⚠ Hors ligne", "err"); }
+    }
+    document.addEventListener("visibilitychange", function(){ if(!document.hidden) verifierDistant(true); });
+    window.addEventListener("online", function(){ if(sale()) planifier(500); else verifierDistant(true); });
+    setInterval(function(){ verifierDistant(false); }, 60000);
+
+    /* ── Chargement initial (appelé une fois par l'appli) ── */
+    async function chargerDonnees(){
+      var local = lireL(CLE_DONNEES);
+      etat("↻ Synchronisation…", "att");
+      try{
+        var meta = await lireMeta();
+        if(!meta){                                     /* serveur vide : on envoie ce qu'on a */
+          if(local !== null){ ecrireL("__sale", "1"); planifier(200); }
+          else etat("✓ Synchronisé");
+          return local;
+        }
+        if(meta.majLe === base()){                     /* déjà à jour */
+          if(sale()) planifier(200); else etat("✓ Synchronisé");
+          return local;
+        }
+        var distant = await lireDistant(meta);
+        if(distant === null) return local;
+        if(local === null || local === distant || (!sale() && base() > 0)){
+          adopter(distant, meta.majLe);                /* cas normal : l'autre appareil a travaillé */
+          etat("✓ Synchronisé");
+          return distant;
+        }
+        /* Premier passage de cet appareil avec des données déjà présentes, ou conflit */
+        var garderServeur = confirm(
+          "Deux versions de la paie existent :\n\n"
+          + "• SERVEUR (" + meta.appareil + ", " + quand(meta.majLe) + ") : " + resume(distant) + "\n"
+          + "• CET APPAREIL : " + resume(local) + "\n\n"
+          + "OK = utiliser la version du SERVEUR\n"
+          + "Annuler = envoyer la version de CET APPAREIL (elle remplacera celle du serveur)\n\n"
+          + "Une copie de secours de la version écartée est gardée.");
+        if(garderServeur){ adopter(distant, meta.majLe); etat("✓ Synchronisé"); return distant; }
+        ecrireL("__secours", distant);
+        ecrireL("__base", String(meta.majLe));
+        ecrireL("__sale", "1");
+        planifier(200);
+        return local;
+      }catch(e){
+        console.warn("Synchro paie :", e);
+        etat("⚠ Hors ligne — données de l'appareil", "err");
+        if(sale()) planifier(30000);
+        return local;
+      }
+    }
+
+    function env(k, v){ return v === null || v === undefined ? null : { key:k, value:v, shared:false }; }
     window.storage = {
-      get: function(k){
-        try{
-          var v = dispo ? localStorage.getItem(PREF+k) : (k in memoire ? memoire[k] : null);
-          return Promise.resolve(v === null || v === undefined ? null : { key:k, value:v, shared:false });
-        }catch(e){ return Promise.resolve(null); }
+      get: async function(k){
+        if(k === CLE_DONNEES) return env(k, await chargerDonnees());
+        return env(k, lireL(k));
       },
       set: function(k, v){
         var t = String(v);
-        try{
-          if(dispo) localStorage.setItem(PREF+k, t); else memoire[k] = t;
-          return Promise.resolve({ key:k, value:t, shared:false });
-        }catch(e){
-          memoire[k] = t;
-          alerter("la memoire du navigateur est pleine");
-          return Promise.resolve(null);
+        if(k === CLE_DONNEES){
+          if(t === lireL(k)) return Promise.resolve({ key:k, value:t, shared:false });
+          if(!ecrireL(k, t) && dispo) etat("⚠ Mémoire pleine — envoi direct", "err");
+          ecrireL("__sale", "1");
+          etat("● Modifié", "att");
+          planifier();
+        }else{
+          ecrireL(k, t);
         }
+        return Promise.resolve({ key:k, value:t, shared:false });
       },
-      delete: function(k){
-        try{ if(dispo) localStorage.removeItem(PREF+k); else delete memoire[k]; }catch(e){}
-        return Promise.resolve({ key:k, deleted:true, shared:false });
-      },
+      delete: function(k){ oublierL(k); return Promise.resolve({ key:k, deleted:true, shared:false }); },
       list: function(prefixe){
         var keys = [];
         try{
           if(dispo){
-            for(var i=0;i<localStorage.length;i++){
+            for(var i = 0; i < localStorage.length; i++){
               var n = localStorage.key(i);
               if(n && n.indexOf(PREF) === 0){
                 var kk = n.slice(PREF.length);
-                if(!prefixe || kk.indexOf(prefixe) === 0) keys.push(kk);
+                if(kk.indexOf("__") !== 0 && (!prefixe || kk.indexOf(prefixe) === 0)) keys.push(kk);
               }
             }
           }else{
-            keys = Object.keys(memoire).filter(function(kk){ return !prefixe || kk.indexOf(prefixe) === 0; });
+            keys = Object.keys(memoire).filter(function(kk){ return kk.indexOf("__") !== 0 && (!prefixe || kk.indexOf(prefixe) === 0); });
           }
         }catch(e){}
         return Promise.resolve({ keys:keys, prefix:prefixe, shared:false });
